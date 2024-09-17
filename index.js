@@ -1,18 +1,25 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+
+async function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 async function getReelUrls(page, instagramUsername, maxReels = 5) {
     await page.goto(`https://www.instagram.com/${instagramUsername}/reels/`);
-    await page.waitForSelector('article a', { timeout: 5000 });
+    await page.waitForSelector('a', { timeout: 50000 });
 
     let reelUrls = [];
     let previousHeight;
 
     while (reelUrls.length < maxReels) {
         const newUrls = await page.evaluate(() => {
-            const links = document.querySelectorAll('article a');
-            return Array.from(links).map(link => link.href);
+            const links = document.querySelectorAll('a');
+            return Array.from(links)
+                .filter(link => link.href.includes('/reel/'))
+                .map(link => link.href);
         });
 
         reelUrls = [...new Set([...reelUrls, ...newUrls])];
@@ -22,49 +29,64 @@ async function getReelUrls(page, instagramUsername, maxReels = 5) {
         previousHeight = await page.evaluate('document.body.scrollHeight');
         await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
         await page.waitForFunction(`document.body.scrollHeight > ${previousHeight}`);
-        await page.waitForTimeout(1000);
+        // await page.waitForTimeout(1000);
     }
 
     return reelUrls.slice(0, maxReels);
 }
 
+async function downloadFile(url, downloadFolder, caption, timestamp) {
+    return new Promise((resolve, reject) => {
+        const fileName = path.basename(new URL(url).pathname);
+        const uniqueFolder = path.join(downloadFolder, timestamp.toString());
+
+        fs.mkdirSync(uniqueFolder, { recursive: true });
+
+        const videoFilePath = path.join(uniqueFolder, fileName);
+        const file = fs.createWriteStream(videoFilePath);
+
+        https.get(url, (response) => {
+            response.pipe(file);
+            file.on('finish', () => {
+                file.close();
+                const captionFilePath = path.join(uniqueFolder, `${fileName}.txt`);
+                fs.writeFile(captionFilePath, caption, (err) => {
+                    if (err) reject(err);
+                    resolve(videoFilePath);
+                });
+            });
+        }).on('error', (err) => {
+            fs.unlink(videoFilePath, () => reject(err));
+        });
+    });
+}
+
 async function downloadReel(page, reelUrl, downloadFolder) {
-    // Navigate to the downloader website
     await page.goto('https://fastdl.app/en');
 
-    // Find the input field and submit button
-    const inputField = await page.$('#search-form-input'); // Replace with actual input field selector
-    // const submitButton = await page.$('#submit-button'); // Replace with actual submit button selector
+    const inputField = await page.$('#search-form-input');
+    const submitButton = await page.$('.search-form__button');
 
-    // Enter the reel URL and submit
     await inputField.type(reelUrl);
-    // await submitButton.click();
+    await submitButton.click();
 
-    // Wait for the download button to appear
     try {
-        await page.waitForSelector('.button__download', { timeout: 15000 }); // Replace with actual download button selector
-        const downloadButton = await page.$('.button__download');
-        
-        // Setup download behavior
-        await page._client.send('Page.setDownloadBehavior', {
-            behavior: 'allow',
-            downloadPath: downloadFolder
-        });
+        await page.waitForSelector('a.button.button--filled.button__download', { timeout: 30000 });
 
-        // Click download button
-        await downloadButton.click();
+        const downloadUrl = await page.$eval('a.button.button--filled.button__download', el => el.href);
+        const caption = await page.$eval('.output-list__caption', el => el.innerText);
 
-        // Wait for download to complete (this may vary depending on the site)
-        await page.waitForTimeout(10000); // Adjust as needed
+        const timestamp = Date.now();
+        const filePath = await downloadFile(downloadUrl, downloadFolder, caption, timestamp);
 
-        console.log(`Downloaded reel: ${reelUrl}`);
+        console.log(`Downloaded reel: ${reelUrl} to ${filePath}`);
     } catch (error) {
         console.error(`Error downloading reel ${reelUrl}: ${error.message}`);
     }
 }
 
 async function processInstagramUser(instagramUsername, downloadFolder, maxReels = 5) {
-    const browser = await puppeteer.launch({ headless: false }); // Set headless: true for production
+    const browser = await puppeteer.launch({ headless: false });
     const page = await browser.newPage();
 
     try {
@@ -73,6 +95,7 @@ async function processInstagramUser(instagramUsername, downloadFolder, maxReels 
 
         for (const reelUrl of reelUrls) {
             await downloadReel(page, reelUrl, downloadFolder);
+            // await sleep(10000);
         }
     } finally {
         await browser.close();
@@ -85,6 +108,6 @@ if (!fs.existsSync(downloadFolder)) {
     fs.mkdirSync(downloadFolder);
 }
 
-const maxReels = 1;
+const maxReels = 2;
 
 processInstagramUser(instagramUsername, downloadFolder, maxReels).catch(console.error);
